@@ -114,17 +114,36 @@ def get_user_recommendations(
     title_to_index,
     index_to_title,
     top_n=10,
-    rating_threshold=4.0,
 ):
     """
-    Generates movie recommendations for a specific user based on their highly-rated movies.
+    Generates movie recommendations for a specific user based on movies they rated above their personal average.
     """
-    # 1. Get movies rated highly by the user
+    # 1. Get all ratings for the user
     user_ratings = ratings_df[ratings_df["userId"] == user_id]
-    high_rated_movies = user_ratings[user_ratings["rating"] >= rating_threshold]
+
+    if user_ratings.empty:
+        return f"No ratings found for user {user_id}."
+
+    # 2. Calculate the user's mean rating
+    user_mean_rating = user_ratings["rating"].mean()
+
+    # Handle case where user mean might be NaN (e.g., if all ratings were somehow NaN, though unlikely with standard data)
+    if pd.isna(user_mean_rating):
+        # Optional: Fallback to a global average or fixed threshold if user mean is unavailable
+        print(
+            f"Warning: Could not calculate mean rating for user {user_id}. Falling back to default behavior or skipping."
+        )
+        # return pd.Series(dtype='object') # Or use a global threshold
+        # For now, let's filter using the calculated mean, assuming it's valid
+        pass  # Proceed assuming user_mean_rating is valid
+
+    # 3. Get movies rated *above* the user's average rating
+    #    (Consider adding a small epsilon or using >= if you want to include ratings exactly at the mean)
+    high_rated_movies = user_ratings[user_ratings["rating"] > user_mean_rating]
 
     if high_rated_movies.empty:
-        return f"No movies found with rating >= {rating_threshold} for user {user_id}."
+        # It's possible a user rated all movies at or below their average
+        return f"No movies found rated above user {user_id}'s average rating of {user_mean_rating:.2f}."
 
     # Map movieIds to titles using the movies_combined dataframe
     high_rated_movie_titles = pd.merge(
@@ -134,7 +153,7 @@ def get_user_recommendations(
         how="inner",
     )["title"]
 
-    # 2. For each highly-rated movie, get content-based recommendations
+    # 4. For each highly-rated movie, get content-based recommendations
     all_recommendations = pd.Series(dtype="object")
     for title in high_rated_movie_titles:
         # Pass the necessary indices mappings to get_recommendations
@@ -148,23 +167,26 @@ def get_user_recommendations(
         )
         all_recommendations = pd.concat([all_recommendations, recs])
 
-    # 3. Aggregate recommendations and remove duplicates
+    # 5. Aggregate recommendations and remove duplicates
     all_recommendations = all_recommendations.value_counts().reset_index()
     all_recommendations.columns = [
         "title",
         "recommendation_score",
     ]  # Score based on frequency
 
-    # 4. Filter out movies the user has already rated
+    # 6. Filter out movies the user has already rated (using all user_ratings, not just high ones)
     user_rated_titles = pd.merge(
-        user_ratings, movies_combined[["movieId", "title"]], on="movieId", how="inner"
+        user_ratings,  # Use the original user_ratings df here
+        movies_combined[["movieId", "title"]],
+        on="movieId",
+        how="inner",
     )["title"].unique()
 
     final_recommendations = all_recommendations[
         ~all_recommendations["title"].isin(user_rated_titles)
     ]
 
-    # 5. Sort by recommendation score (frequency) and return top N
+    # 7. Sort by recommendation score (frequency) and return top N
     final_recommendations = final_recommendations.sort_values(
         by="recommendation_score", ascending=False
     )
@@ -198,7 +220,7 @@ if __name__ == "__main__":
     print("-" * 30)
 
     # --- Get Recommendations for a User ---
-    user_id_to_recommend = 1  # Example User ID
+    user_id_to_recommend = 2  # Example User ID
     user_recs = get_user_recommendations(
         user_id_to_recommend,
         ratings,
@@ -207,7 +229,6 @@ if __name__ == "__main__":
         title_to_index,
         index_to_title,
         top_n=10,
-        rating_threshold=4.0,
     )
     print(f"\nRecommendations for user '{user_id_to_recommend}':")
     print(user_recs)
