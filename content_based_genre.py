@@ -65,12 +65,20 @@ def create_combined_features(movies_df, tags_df, ratings_df=None):
 
     # Create indices mapping title to index and index to title for quick lookups
     movies_combined["original_index"] = movies_combined.index
-    title_to_index = pd.Series(
+
+    # Create Series first
+    title_to_index_series = pd.Series(
         movies_combined.index, index=movies_combined["title"]
-    ).drop_duplicates()
+    )
+    # Ensure the index (titles) is unique by keeping the first occurrence
+    title_to_index = title_to_index_series[
+        ~title_to_index_series.index.duplicated(keep="first")
+    ]
+
+    # For index_to_title, the original approach is likely fine as DataFrame indices are unique
     index_to_title = pd.Series(
         movies_combined["title"], index=movies_combined.index
-    ).drop_duplicates()
+    ).drop_duplicates()  # drop_duplicates on values (titles) is ok here
 
     return movies_combined, title_to_index, index_to_title
 
