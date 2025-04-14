@@ -38,163 +38,216 @@ def aggregate_ratings(ratings_df):
 
 
 def create_combined_features(movies_df, tags_df, ratings_df=None):
+    # Keep movieId
+    movies_processed = movies_df.copy()
+
     # Preprocess genres
-    movies_df["processed_genres"] = (
-        movies_df["genres"].fillna("").apply(preprocess_genres)
+    movies_processed["processed_genres"] = (
+        movies_processed["genres"].fillna("").apply(preprocess_genres)
     )
 
-    # Aggregate tags by movieId
+    # Aggregate tags by movieId (already does this)
     agg_tags = aggregate_tags(tags_df)
 
-    # Merge tags with movies (left join to retain all movies)
-    movies_combined = pd.merge(movies_df, agg_tags, on="movieId", how="left")
+    # Merge tags with movies using movieId
+    movies_combined = pd.merge(movies_processed, agg_tags, on="movieId", how="left")
     movies_combined["tag"] = movies_combined["tag"].fillna("")
 
-    # Combine genres and tags into one string
+    # Combine genres and tags
     movies_combined["combined_features"] = (
         movies_combined["processed_genres"] + " " + movies_combined["tag"]
     )
 
+    # Add ratings if provided
     if ratings_df is not None:
-        agg_ratings = aggregate_ratings(ratings_df)
+        agg_ratings = aggregate_ratings(ratings_df)  # Groups by movieId
         movies_combined = pd.merge(
             movies_combined, agg_ratings, on="movieId", how="left"
         )
+        # Fill NaNs introduced by left merge if a movie has no ratings
         movies_combined["avg_rating"] = movies_combined["avg_rating"].fillna(0)
         movies_combined["rating_count"] = movies_combined["rating_count"].fillna(0)
 
-    # Create indices mapping title to index and index to title for quick lookups
-    movies_combined["original_index"] = movies_combined.index
+    # Drop duplicates based on movieId *before* creating indices
+    movies_combined.drop_duplicates(subset="movieId", keep="first", inplace=True)
 
-    # Create Series first
-    title_to_index_series = pd.Series(
-        movies_combined.index, index=movies_combined["title"]
-    )
-    # Ensure the index (titles) is unique by keeping the first occurrence
-    title_to_index = title_to_index_series[
-        ~title_to_index_series.index.duplicated(keep="first")
-    ]
+    # Reset index after potential drop_duplicates to ensure it's contiguous 0..N-1
+    movies_combined.reset_index(drop=True, inplace=True)  # Crucial for TF-IDF alignment
 
-    # For index_to_title, the original approach is likely fine as DataFrame indices are unique
-    index_to_title = pd.Series(
-        movies_combined["title"], index=movies_combined.index
-    ).drop_duplicates()  # drop_duplicates on values (titles) is ok here
+    # Create mappings based on the *final* DataFrame index and movieId
+    # Extract numpy arrays to avoid potential index alignment issues
+    movie_ids_array = movies_combined["movieId"].to_numpy()
+    titles_array = movies_combined["title"].to_numpy()
+    df_indices_array = (
+        movies_combined.index.to_numpy()
+    )  # Should be 0..N-1 after reset_index
 
-    return movies_combined, title_to_index, index_to_title
+    # movieId -> index (row number in movies_combined/TF-IDF matrix)
+    movieId_to_index = pd.Series(df_indices_array, index=movie_ids_array)
+
+    # index -> movieId
+    index_to_movieId = pd.Series(movie_ids_array, index=df_indices_array)
+
+    # movieId -> title (useful for display)
+    movieId_to_title = pd.Series(titles_array, index=movie_ids_array)
+
+    # Return the combined dataframe and the new mappings
+    return movies_combined, movieId_to_index, index_to_movieId, movieId_to_title
 
 
 def create_tfidf_matrix(df):
     tfidf = TfidfVectorizer(stop_words="english")
+    # Ensure combined_features doesn't have NaNs after merges/processing
+    df["combined_features"] = df["combined_features"].fillna("")
     tfidf_matrix = tfidf.fit_transform(df["combined_features"])
     return tfidf_matrix
 
 
 def get_recommendations(
-    title, df, tfidf_matrix, title_to_index, index_to_title, top_n=10
+    movie_id,  # Changed from title
+    df,  # This is movies_combined
+    tfidf_matrix,
+    movieId_to_index,  # New mapping
+    index_to_movieId,  # New mapping
+    movieId_to_title,  # New mapping
+    top_n=10,
 ):
-    if title not in title_to_index:
-        print(f"Warning: Movie '{title}' not found in the database.")
-        return pd.Series(dtype="object")  # Return empty series if title not found
-    idx = title_to_index[title]
-    # Ensure index is within bounds
+    # Check if movie_id exists
+    if movie_id not in movieId_to_index:
+        # Try to get title for warning, fallback if ID not in movieId_to_title either
+        title_for_warning = movieId_to_title.get(movie_id, f"ID {movie_id}")
+        print(
+            f"Warning: Movie '{title_for_warning}' (ID: {movie_id}) not found in the processed database."
+        )
+        return pd.Series(dtype="object")
+
+    # Get the index for the TF-IDF matrix
+    idx = movieId_to_index[movie_id]
+
+    # Ensure index is within bounds (should be guaranteed by reset_index, but good check)
     if idx >= tfidf_matrix.shape[0]:
-        print(f"Warning: Index for movie '{title}' is out of bounds.")
+        title_for_warning = movieId_to_title.get(movie_id, f"ID {movie_id}")
+        print(
+            f"Warning: Index {idx} for movie '{title_for_warning}' (ID: {movie_id}) is out of bounds for TF-IDF matrix shape {tfidf_matrix.shape[0]}."
+        )
         return pd.Series(dtype="object")
 
     # Calculate cosine similarity
     cosine_sim = linear_kernel(tfidf_matrix[idx : idx + 1], tfidf_matrix).flatten()
+
     # Get indices of top N similar movies, excluding the movie itself
     similar_indices = cosine_sim.argsort()[-(top_n + 1) :][::-1]
+    # Filter out the original movie's *index*
     similar_indices = [i for i in similar_indices if i != idx][:top_n]
 
-    # Get titles and potentially re-rank by average rating
-    recommended = df.iloc[similar_indices].copy()
-    recommended = recommended.sort_values(by="avg_rating", ascending=False)
+    # Get the recommended movieIds using the index_to_movieId mapping
+    # Ensure indices are valid before accessing .loc
+    valid_similar_indices = [i for i in similar_indices if i < len(index_to_movieId)]
+    if not valid_similar_indices:
+        return pd.Series(dtype="object")  # No valid recommendations found
 
-    return recommended["title"]
+    recommended_movie_ids = index_to_movieId.loc[valid_similar_indices]
+
+    # Get the corresponding slice from the combined dataframe for sorting by rating
+    recommended_df = df.iloc[
+        valid_similar_indices
+    ].copy()  # Get rows using matrix indices
+
+    # Sort by average rating
+    recommended_df = recommended_df.sort_values(by="avg_rating", ascending=False)
+
+    # Return the titles of the recommended movies using movieId_to_title mapping on sorted df
+    recommended_titles = recommended_df["movieId"].map(movieId_to_title)
+
+    return recommended_titles  # Returns a Series of titles
 
 
 def get_user_recommendations(
     user_id,
     ratings_df,
-    movies_combined,
+    movies_combined,  # This is the df passed to get_recommendations
     tfidf_matrix,
-    title_to_index,
-    index_to_title,
+    movieId_to_index,  # New mapping
+    index_to_movieId,  # New mapping
+    movieId_to_title,  # New mapping
     top_n=10,
 ):
     """
     Generates movie recommendations for a specific user based on movies they rated above their personal average.
+    Uses movieId as the primary identifier.
     """
     # 1. Get all ratings for the user
     user_ratings = ratings_df[ratings_df["userId"] == user_id]
 
     if user_ratings.empty:
-        return f"No ratings found for user {user_id}."
+        print(f"No ratings found for user {user_id}.")
+        # Return empty Series for consistency
+        return pd.Series(dtype="object")
 
     # 2. Calculate the user's mean rating
     user_mean_rating = user_ratings["rating"].mean()
 
-    # Handle case where user mean might be NaN (e.g., if all ratings were somehow NaN, though unlikely with standard data)
     if pd.isna(user_mean_rating):
-        # Optional: Fallback to a global average or fixed threshold if user mean is unavailable
+        print(f"Warning: Could not calculate mean rating for user {user_id}.")
+        return pd.Series(dtype="object")
+
+    # 3. Get movieIds rated *above* the user's average rating
+    high_rated_movie_ids = user_ratings[user_ratings["rating"] > user_mean_rating][
+        "movieId"
+    ].tolist()
+
+    if not high_rated_movie_ids:
         print(
-            f"Warning: Could not calculate mean rating for user {user_id}. Falling back to default behavior or skipping."
+            f"No movies found rated above user {user_id}'s average rating of {user_mean_rating:.2f}."
         )
-        # return pd.Series(dtype='object') # Or use a global threshold
-        # For now, let's filter using the calculated mean, assuming it's valid
-        pass  # Proceed assuming user_mean_rating is valid
+        # Return empty Series for consistency
+        return pd.Series(dtype="object")
 
-    # 3. Get movies rated *above* the user's average rating
-    #    (Consider adding a small epsilon or using >= if you want to include ratings exactly at the mean)
-    high_rated_movies = user_ratings[user_ratings["rating"] > user_mean_rating]
+    # 4. For each highly-rated movie_id, get content-based recommendations
+    all_recommended_titles = pd.Series(dtype="object")
+    for m_id in high_rated_movie_ids:
+        # Check if the movie ID exists in our processed data before getting recs
+        if m_id in movieId_to_index:
+            recs = get_recommendations(
+                m_id,  # Pass movie_id
+                movies_combined,
+                tfidf_matrix,
+                movieId_to_index,
+                index_to_movieId,
+                movieId_to_title,  # Pass mapping
+                top_n=top_n,
+            )
+            # Concatenate the resulting Series of titles
+            all_recommended_titles = pd.concat([all_recommended_titles, recs])
+        # else: # Optional: Warn if a rated movie isn't in the combined set
+        # print(f"Skipping recommendations for rated movieId {m_id} as it's not in the processed movie data.")
 
-    if high_rated_movies.empty:
-        # It's possible a user rated all movies at or below their average
-        return f"No movies found rated above user {user_id}'s average rating of {user_mean_rating:.2f}."
-
-    # Map movieIds to titles using the movies_combined dataframe
-    high_rated_movie_titles = pd.merge(
-        high_rated_movies,
-        movies_combined[["movieId", "title"]],
-        on="movieId",
-        how="inner",
-    )["title"]
-
-    # 4. For each highly-rated movie, get content-based recommendations
-    all_recommendations = pd.Series(dtype="object")
-    for title in high_rated_movie_titles:
-        # Pass the necessary indices mappings to get_recommendations
-        recs = get_recommendations(
-            title,
-            movies_combined,
-            tfidf_matrix,
-            title_to_index,
-            index_to_title,
-            top_n=top_n,
+    if all_recommended_titles.empty:
+        print(
+            f"Could not generate recommendations based on user {user_id}'s highly rated movies (maybe none had similar movies?)."
         )
-        all_recommendations = pd.concat([all_recommendations, recs])
+        # Return empty Series for consistency
+        return pd.Series(dtype="object")
 
-    # 5. Aggregate recommendations and remove duplicates
-    all_recommendations = all_recommendations.value_counts().reset_index()
-    all_recommendations.columns = [
-        "title",
-        "recommendation_score",
-    ]  # Score based on frequency
+    # 5. Aggregate recommendations (titles) and count frequency
+    recommendation_counts = all_recommended_titles.value_counts().reset_index()
+    recommendation_counts.columns = ["title", "recommendation_score"]
 
-    # 6. Filter out movies the user has already rated (using all user_ratings, not just high ones)
-    user_rated_titles = pd.merge(
-        user_ratings,  # Use the original user_ratings df here
-        movies_combined[["movieId", "title"]],
-        on="movieId",
-        how="inner",
-    )["title"].unique()
-
-    final_recommendations = all_recommendations[
-        ~all_recommendations["title"].isin(user_rated_titles)
+    # 6. Filter out movies the user has already rated
+    # Get titles of all movies rated by the user
+    user_rated_movie_ids = user_ratings["movieId"].unique()
+    # Map these IDs to titles, handling potential missing IDs safely
+    user_rated_titles = [
+        movieId_to_title.get(mid)
+        for mid in user_rated_movie_ids
+        if mid in movieId_to_title
     ]
 
-    # 7. Sort by recommendation score (frequency) and return top N
+    final_recommendations = recommendation_counts[
+        ~recommendation_counts["title"].isin(user_rated_titles)
+    ]
+
+    # 7. Sort by recommendation score (frequency) and return top N titles
     final_recommendations = final_recommendations.sort_values(
         by="recommendation_score", ascending=False
     )
@@ -204,39 +257,84 @@ def get_user_recommendations(
 
 if __name__ == "__main__":
     # --- Loading Data ---
+    print("Loading data...")
     movies = load_movies("/Users/christseng/Downloads/ml-32m/movies.csv")
     tags = load_tags("/Users/christseng/Downloads/ml-32m/tags.csv")
     ratings = load_ratings("/Users/christseng/Downloads/ml-32m/ratings.csv")
+    print("Data loaded.")
 
     # --- Preprocessing and Feature Engineering ---
-    # Pass ratings to include avg_rating and rating_count
-    movies_combined, title_to_index, index_to_title = create_combined_features(
-        movies, tags, ratings
+    print("Creating combined features and mappings...")
+    # Now returns movieId based mappings
+    movies_combined, movieId_to_index, index_to_movieId, movieId_to_title = (
+        create_combined_features(movies, tags, ratings)
     )
+    print("Features created.")
 
     # --- TF-IDF Matrix ---
+    # Ensure movies_combined has the reset index for alignment
+    print("Creating TF-IDF matrix...")
     tfidf_matrix = create_tfidf_matrix(movies_combined)
+    print(f"TF-IDF matrix created with shape: {tfidf_matrix.shape}")
 
     # --- Get Recommendations for a Movie ---
-    movie_title = "Toy Story (1995)"
-    # Pass the indices to the function
-    movie_recs = get_recommendations(
-        movie_title, movies_combined, tfidf_matrix, title_to_index, index_to_title
-    )
-    print(f"Recommendations for movie '{movie_title}':")
-    print(movie_recs)
+    movie_title_to_find = "Toy Story (1995)"
+    print(f"\nFinding recommendations for movie '{movie_title_to_find}'...")
+    # Find the movieId for the title
+    try:
+        # Find movieIds matching the title
+        matching_ids = movieId_to_title[movieId_to_title == movie_title_to_find].index
+        if not matching_ids.empty:
+            target_movie_id = matching_ids[0]  # Use the first matching ID
+            print(f"Found movieId {target_movie_id} for '{movie_title_to_find}'.")
+
+            movie_recs = get_recommendations(
+                target_movie_id,  # Pass movie_id
+                movies_combined,
+                tfidf_matrix,
+                movieId_to_index,
+                index_to_movieId,
+                movieId_to_title,  # Pass mapping
+                top_n=10,  # Specify top_n here if desired
+            )
+            print(
+                f"\nRecommendations for movie '{movie_title_to_find}' (ID: {target_movie_id}):"
+            )
+            print(movie_recs)
+        else:
+            print(
+                f"Movie title '{movie_title_to_find}' not found in the processed data."
+            )
+
+    except Exception as e:
+        print(f"Error getting recommendations for movie '{movie_title_to_find}': {e}")
+
     print("-" * 30)
 
     # --- Get Recommendations for a User ---
-    user_id_to_recommend = 2  # Example User ID
-    user_recs = get_user_recommendations(
-        user_id_to_recommend,
-        ratings,
-        movies_combined,
-        tfidf_matrix,
-        title_to_index,
-        index_to_title,
-        top_n=10,
-    )
-    print(f"\nRecommendations for user '{user_id_to_recommend}':")
-    print(user_recs)
+    user_id_to_recommend = 3  # Example User ID
+    print(f"\nFinding recommendations for user '{user_id_to_recommend}'...")
+    try:
+        user_recs = get_user_recommendations(
+            user_id_to_recommend,
+            ratings,
+            movies_combined,
+            tfidf_matrix,
+            movieId_to_index,  # Pass new mapping
+            index_to_movieId,  # Pass new mapping
+            movieId_to_title,  # Pass new mapping
+            top_n=10,
+        )
+        print(f"\nRecommendations for user '{user_id_to_recommend}':")
+        # Check if the result is a Series (recommendations found) or a message/empty Series
+        if isinstance(user_recs, pd.Series) and not user_recs.empty:
+            print(user_recs)
+        elif isinstance(user_recs, pd.Series) and user_recs.empty:
+            # Handle case where function returns empty series (e.g., no recs after filtering)
+            # The function itself prints messages for most cases (no ratings, no high ratings etc)
+            print("No recommendations found for this user after filtering.")
+        else:
+            print(user_recs)  # Print the message string returned by the function
+
+    except Exception as e:
+        print(f"Error getting recommendations for user {user_id_to_recommend}: {e}")
